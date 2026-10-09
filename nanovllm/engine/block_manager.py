@@ -33,7 +33,7 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1): # prefix=前一个块的哈希编码
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
@@ -43,6 +43,7 @@ class BlockManager:
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
         block = self.blocks[block_id]
+        # 如果这个空闲块仍保留旧缓存索引，现在要给它换新内容，就必须移除旧索引。
         assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
@@ -65,6 +66,10 @@ class BlockManager:
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
+            # - 命中正在使用的块：增加引用即可，不消耗空闲块。
+            # - 命中空闲块：虽然无需重算，但后续仍要从空闲集合取回这个块。所以num_new_blocks不减1
+            # “空闲”表示当前没有请求占用，可以重新分配，不表示里面没有有效数据。
+            # `can_allocate()` 和 `allocate()` 由同一个主进程顺序执行，中间没有其他请求并发分配块
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
@@ -83,6 +88,7 @@ class BlockManager:
             if block_id in self.used_block_ids:
                 block.ref_count += 1
             else:
+                # 命中了空闲块
                 block.ref_count = 1
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
@@ -100,6 +106,7 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    # 如果len(seq) % self.block_size==1说明要一个新的block，就要看当前是否还有空闲块
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
@@ -107,6 +114,7 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    # 更新本轮新分配的block的hash
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

@@ -31,10 +31,12 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # 预热：估计模型执行需要多少显存 跑一次较大的prefill请求
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+        # 恢复默认 dtype，并把默认设备设为 CPU。后续输入准备就先在 CPU 创建张量，再传到 GPU。
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -109,9 +111,12 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        # 一个物理块在当前 rank 上占用：K和V两份× 模型层数× 每块token数× 本rank的KV头数× 每头维度× 每元素字节数
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # 先估算剩余缓存预算，再除以每块字节数。`peak - current` 近似预留预热时的额外运行开销
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        # [K/V, 层, 物理块, 块内token, KV头, head_dim]
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -120,7 +125,8 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    # 把 Python 块表变成 GPU 张量
+    def prepare_block_tables(self, seqs: list[Sequence]): 
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -139,15 +145,19 @@ class ModelRunner:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
+            # - Q 长度：本轮新输入模型的 token 数。
+            # - K 长度：本轮注意力需要看到的完整上下文长度，包括已有缓存
             seqlen_k = end
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q) # 累积长度边界
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
+            # slot_mapping：新 token 要写到哪里 注意力层产生新 K/V 后，就按这个数组写入缓存。
+            # 根据这些 slot 写入该层的 `k_cache`、`v_cache`。所有层使用相同 slot，但写入各自的层切片。
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
@@ -159,6 +169,7 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+        # 如果 K 的总长度比新 query 总长度大，说明至少一条序列已有缓存前缀，需要用块表读取完整 K/V。
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -166,6 +177,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # 负责保存当前这一次模型执行的注意力元数据
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -194,11 +206,13 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # `eager execution` 通常译为“即时执行”：程序运行到一个算子，就立即提交这个算子的计算，而不是先记录整段计算，再统一执行。
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
+            # 选一个不小于真实批大小的图。
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
@@ -209,6 +223,8 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
+            # 图捕获时，代码记录了：outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+            # 所以回放：会执行模型计算，并将这一次的新隐藏状态写入固定的 `outputs` 缓冲区。
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:

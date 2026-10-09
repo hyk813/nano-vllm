@@ -8,8 +8,8 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
-        self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_num_seqs = config.max_num_seqs # 一次模型执行最多处理多少条序列
+        self.max_num_batched_tokens = config.max_num_batched_tokens # 一次 prefill 最多处理多少 token
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -32,9 +32,13 @@ class Scheduler:
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
-            if not seq.block_table:
+            # 确定还有多少 token 需要计算
+            # 如果这个seq的块表为空
+            if not seq.block_table:    
+                # 检查有多少cached的token，以及是否有空间来容纳这个请求
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
+                    # 队首请求因缓存不足而无法安排时，代码直接 `break`
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
@@ -45,18 +49,21 @@ class Scheduler:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
+            # 如果下面这个条件不成立，就是分段prefill，后续还要继续在等待队列队首
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
 
+        # 先尝试安排prefill，如果没有prefill，才组成decode batch
         if scheduled_seqs:
             return scheduled_seqs, True
 
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            # 先确认缓存还能容纳这个 token
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -72,6 +79,7 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+        #seq是被抢占的请求，把该seq暂停并释放KV
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
